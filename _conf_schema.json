@@ -824,30 +824,38 @@
       "voice_states": {
         "description": "强制语音的日程状态",
         "type": "list",
-        "hint": "日程当前状态的 state 字段落在这里时，回复和主动消息都强制用语音。常用值：transit（通勤）、busy（忙）、focus（专注）。",
+        "hint": "忙/通勤等状态：每条回复按 busy_voice_probability 掷骰。常用值：transit（通勤）、busy（忙）、focus（专注）。",
         "default": [
           "transit",
           "busy",
           "focus"
         ]
       },
-      "reply_voice_probability": {
-        "description": "其它状态的语音概率",
-        "type": "float",
-        "hint": "按「对话」计，不是按消息计：0.2 表示大约每 5 次对话有 1 次用语音；同一对话内保持一致，超过间隔视为新对话。",
-        "default": 0.2
-      },
-      "conversation_gap_minutes": {
-        "description": "对话间隔（分钟）",
-        "type": "int",
-        "hint": "超过该时间没有新消息，下一次对话会重新掷骰子。",
-        "default": 30
-      },
       "proactive_voice": {
         "description": "主动消息使用语音",
         "type": "bool",
-        "hint": "开启后，处于强制语音状态时主动消息发纯语音；其它状态发纯文字。",
+        "hint": "开启后，主动消息也按所在状态的语音概率决定发语音还是文字（每条独立掷骰）。",
         "default": true
+      },
+      "busy_voice_probability": {
+        "description": "忙/通勤状态语音概率",
+        "type": "float",
+        "hint": "每条输出独立计算：0.7 表示一次对话里输出 10 条消息，约 7 条是语音。",
+        "default": 0.7
+      },
+      "idle_states": {
+        "description": "空闲状态",
+        "type": "list",
+        "hint": "这些状态按 idle_voice_probability 掷骰，默认 available。",
+        "default": [
+          "available"
+        ]
+      },
+      "idle_voice_probability": {
+        "description": "空闲状态语音概率",
+        "type": "float",
+        "hint": "每条输出独立计算，默认 0.2。",
+        "default": 0.2
       }
     }
   }

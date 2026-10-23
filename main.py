@@ -99,7 +99,6 @@ class ProactiveVirtualDailyPlugin(Star):
         self.renewal_attempts: dict[str, int] = {}
         self._personal_network_unavailable_logged = False
         self._startup_generated_date: str | None = None
-        self._voice_decisions: dict[str, tuple[bool, float]] = {}
 
     def _resolve_timezone(self) -> ZoneInfo:
         try:
@@ -159,33 +158,34 @@ class ProactiveVirtualDailyPlugin(Star):
             raw = ["transit", "busy", "focus"]
         return {str(item).strip() for item in raw if str(item).strip()}
 
-    def _voice_reply_decision(self, umo: str, state: str) -> bool:
-        """决定本轮回复是否用语音。
+    def _idle_states(self) -> set[str]:
+        settings = self._voice_settings()
+        raw = settings.get("idle_states")
+        if not isinstance(raw, list) or not raw:
+            raw = ["available"]
+        return {str(item).strip() for item in raw if str(item).strip()}
 
-        - transit / busy / focus：直接语音
-        - 其它状态：每次「对话」掷一次骰子（概率 reply_voice_probability），
-          同一对话内保持结果，超过 conversation_gap_minutes 视为新对话
-        """
+    def _voice_probability(self, state: str) -> float:
+        """按当前状态返回「这一条回复用语音」的概率。"""
         settings = self._voice_settings()
         if not settings.get("enable", True):
-            return False
+            return 0.0
         if state in self._voice_states():
-            return True
+            return float(settings.get("busy_voice_probability", 0.7))
+        if state in self._idle_states():
+            return float(settings.get("idle_voice_probability", 0.2))
+        return 0.0
+
+    def _voice_reply_decision(self, umo: str, state: str) -> bool:
+        """每条输出独立掷骰：忙/通勤 0.7，空闲 0.2，其它状态文字。"""
         if self._voice_plugin() is None:
             return False
-
-        now_ts = self._now().timestamp()
-        gap = max(0, int(settings.get("conversation_gap_minutes", 30))) * 60
-        previous = self._voice_decisions.get(umo)
-        if previous is not None and now_ts - previous[1] <= gap:
-            self._voice_decisions[umo] = (previous[0], now_ts)
-            return previous[0]
-
-        probability = float(settings.get("reply_voice_probability", 0.2))
+        probability = self._voice_probability(state)
+        if probability <= 0:
+            return False
         want = random.random() < probability
-        self._voice_decisions[umo] = (want, now_ts)
         logger.info(
-            "[虚拟人生] 新对话语音判定 umo=%s state=%s want_voice=%s p=%s",
+            "[虚拟人生] 语音判定 umo=%s state=%s want_voice=%s p=%.2f",
             umo,
             state or "unknown",
             want,
@@ -199,7 +199,10 @@ class ProactiveVirtualDailyPlugin(Star):
             return False
         if not settings.get("proactive_voice", True):
             return False
-        return state in self._voice_states() and self._voice_plugin() is not None
+        if self._voice_plugin() is None:
+            return False
+        probability = self._voice_probability(state)
+        return probability > 0 and random.random() < probability
 
     async def _send_proactive_voice(self, umo: str, text: str, state: str) -> bool:
         if not self._proactive_voice_enabled(state):
