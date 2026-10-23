@@ -156,25 +156,42 @@ class ProactiveVirtualDailyPlugin(Star):
         raw = settings.get("voice_states")
         if not isinstance(raw, list) or not raw:
             raw = ["transit", "busy", "focus"]
-        return {str(item).strip() for item in raw if str(item).strip()}
+        return {str(item).strip().lower() for item in raw if str(item).strip()}
 
     def _idle_states(self) -> set[str]:
         settings = self._voice_settings()
         raw = settings.get("idle_states")
         if not isinstance(raw, list) or not raw:
-            raw = ["available"]
-        return {str(item).strip() for item in raw if str(item).strip()}
+            raw = ["available", "social"]
+        return {str(item).strip().lower() for item in raw if str(item).strip()}
+
+    def _silent_states(self) -> set[str]:
+        settings = self._voice_settings()
+        raw = settings.get("silent_states")
+        if not isinstance(raw, list) or not raw:
+            raw = ["sleep", "resting", "asleep"]
+        return {str(item).strip().lower() for item in raw if str(item).strip()}
 
     def _voice_probability(self, state: str) -> float:
-        """按当前状态返回「这一条输出用语音」的概率。"""
+        """按当前状态返回「这一条输出用语音」的概率。
+
+        忙/通勤/专注 → busy 概率；空闲/社交 → idle 概率；
+        睡眠 → 0；其它未知状态自动按空闲处理。
+        """
         settings = self._voice_settings()
         if not settings.get("enable", True):
             return 0.0
-        if state in self._voice_states():
+        key = str(state or "").strip().lower()
+        if not key:
+            return 0.0
+        if key in self._voice_states():
             return float(settings.get("busy_voice_probability", 0.7))
-        if state in self._idle_states():
-            return float(settings.get("idle_voice_probability", 0.2))
-        return 0.0
+        if key in self._silent_states():
+            return 0.0
+        idle_probability = float(settings.get("idle_voice_probability", 0.2))
+        if key in self._idle_states():
+            return idle_probability
+        return idle_probability
 
     async def terminate(self) -> None:
         self.runtime.stop()

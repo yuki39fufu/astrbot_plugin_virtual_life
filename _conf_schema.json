@@ -846,9 +846,10 @@
       "idle_states": {
         "description": "空闲状态",
         "type": "list",
-        "hint": "这些状态按 idle_voice_probability 掷骰，默认 available。",
+        "hint": "这些状态按 idle_voice_probability 掷骰；社交、空闲、未知状态都归到这里。",
         "default": [
-          "available"
+          "available",
+          "social"
         ]
       },
       "idle_voice_probability": {
@@ -856,6 +857,16 @@
         "type": "float",
         "hint": "每条输出独立计算，默认 0.2。",
         "default": 0.2
+      },
+      "silent_states": {
+        "description": "静音状态",
+        "type": "list",
+        "hint": "这些状态不发语音（默认睡眠）。",
+        "default": [
+          "sleep",
+          "resting",
+          "asleep"
+        ]
       }
     }
   }
