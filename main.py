@@ -113,8 +113,29 @@ class ProactiveVirtualDailyPlugin(Star):
         schedule_settings = self.config.get("schedule_settings", {}) or {}
         generate_time = str(schedule_settings.get("generate_time", "07:00"))
         self.runtime.start(generate_time, self._daily_refresh)
+        await self._wait_for_provider()
         await self._refresh_all(force=False)
         logger.info("[虚拟人生] 插件已启动，时区=%s", self.timezone.key)
+
+    async def _wait_for_provider(self, timeout: float = 15.0) -> None:
+        """等待 AstrBot 的 Provider 加载完成。
+
+        AstrBot 先加载插件、后加载 Provider。若在 Provider 就绪前生成当天计划，
+        会得到 no LLM provider available，并把当天计划写成 failed。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            try:
+                if self.context.get_using_provider() is not None:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        logger.warning(
+            "[虚拟人生] Provider 在 %.0fs 内未就绪，日程生成可能失败",
+            timeout,
+        )
 
     async def terminate(self) -> None:
         self.runtime.stop()
@@ -527,7 +548,13 @@ class ProactiveVirtualDailyPlugin(Star):
             relationship_context=relationship_context,
             include_schedule=include_schedule,
             include_outfit=include_outfit,
-            base_plan=existing if preserve_disabled else None,
+            base_plan=(
+                existing
+                if preserve_disabled
+                and existing is not None
+                and existing.status == "ok"
+                else None
+            ),
         )
         plan_key = self.storage.plan_key(date_str, persona.id)
         previous_plan = self.storage.plans.get(plan_key)
