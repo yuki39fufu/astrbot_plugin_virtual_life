@@ -98,6 +98,7 @@ class ProactiveVirtualDailyPlugin(Star):
         self._window_retry_counts: dict[tuple[str, str, str], int] = {}
         self.renewal_attempts: dict[str, int] = {}
         self._personal_network_unavailable_logged = False
+        self._startup_generated_date: str | None = None
 
     def _resolve_timezone(self) -> ZoneInfo:
         try:
@@ -114,7 +115,7 @@ class ProactiveVirtualDailyPlugin(Star):
         generate_time = str(schedule_settings.get("generate_time", "07:00"))
         self.runtime.start(generate_time, self._daily_refresh)
         await self._wait_for_provider()
-        await self._refresh_all(force=False)
+        await self._startup_refresh()
         logger.info("[虚拟人生] 插件已启动，时区=%s", self.timezone.key)
 
     async def _wait_for_provider(self, timeout: float = 15.0) -> None:
@@ -440,9 +441,46 @@ class ProactiveVirtualDailyPlugin(Star):
                     )
 
     async def _daily_refresh(self) -> None:
+        today = self._now().date()
+        if self._startup_generated_date == today.isoformat() and await self._plans_ready(
+            today
+        ):
+            logger.info("[虚拟人生] 今日日程已在启动时生成，跳过本次定时生成")
+            return
         await self._refresh_all(force=True)
 
-    async def _refresh_all(self, *, force: bool) -> None:
+    async def _startup_refresh(self) -> None:
+        """服务启动后立即尝试生成今日日程。
+
+        成功后记下日期，当天的定时任务不再重复生成；失败则留给定时任务兜底重试。
+        """
+        today = self._now().date()
+        try:
+            await self._refresh_all(force=False, regenerate_failed=True)
+        except Exception as exc:
+            logger.warning(
+                "[虚拟人生] 启动时生成日程失败，等待定时任务重试：%s",
+                exc,
+            )
+            return
+        if await self._plans_ready(today):
+            self._startup_generated_date = today.isoformat()
+            logger.info("[虚拟人生] 启动时已生成今日日程，今天的定时生成将跳过")
+        else:
+            logger.warning("[虚拟人生] 启动时日程未就绪，等待定时任务重试")
+
+    async def _plans_ready(self, target: date) -> bool:
+        """当日所有启用会话的计划是否都已就绪（status=ok 且有时间线）。"""
+        ready = False
+        for umo in self.policy.enabled_sessions():
+            persona = await self.personas.resolve(umo)
+            plan = self.storage.get_plan(target.isoformat(), persona.id)
+            if plan is None or plan.status != "ok" or not plan.timeline:
+                return False
+            ready = True
+        return ready
+
+    async def _refresh_all(self, *, force: bool, regenerate_failed: bool = False) -> None:
         async with self.refresh_lock:
             now = self._now()
             self.storage.prune_schedule_requirements(now.date())
@@ -454,7 +492,11 @@ class ProactiveVirtualDailyPlugin(Star):
 
             for persona, sessions in grouped.values():
                 await self._record_completed_personal_network_events(persona.id, now)
-                plan = await self._ensure_plan(persona, now.date(), force=force)
+                existing = self.storage.get_plan(now.date().isoformat(), persona.id)
+                need_force = force or existing is None or (
+                    regenerate_failed and existing.status != "ok"
+                )
+                plan = await self._ensure_plan(persona, now.date(), force=need_force)
                 for umo in sessions:
                     await self._schedule_session(umo, persona, plan)
 
