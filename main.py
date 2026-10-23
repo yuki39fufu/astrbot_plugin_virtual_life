@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Record, Reply
+from astrbot.api.message_components import Image, Plain, Record, Reply
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -99,6 +99,7 @@ class ProactiveVirtualDailyPlugin(Star):
         self.renewal_attempts: dict[str, int] = {}
         self._personal_network_unavailable_logged = False
         self._startup_generated_date: str | None = None
+        self._voice_decisions: dict[str, tuple[bool, float]] = {}
 
     def _resolve_timezone(self) -> ZoneInfo:
         try:
@@ -137,6 +138,79 @@ class ProactiveVirtualDailyPlugin(Star):
             "[虚拟人生] Provider 在 %.0fs 内未就绪，日程生成可能失败",
             timeout,
         )
+
+    # ------------------------------------------------------------------ 语音联动
+
+    def _voice_settings(self) -> dict:
+        return self.config.get("voice_settings", {}) or {}
+
+    def _voice_plugin(self):
+        """取语音插件实例（astrbot_plugin_voice_file），不可用时返回 None。"""
+        meta = self.context.get_registered_star("astrbot_plugin_voice_file")
+        plugin = getattr(meta, "star_cls", None) if meta else None
+        if plugin is None or not hasattr(plugin, "synthesize_voice"):
+            return None
+        return plugin
+
+    def _voice_states(self) -> set[str]:
+        settings = self._voice_settings()
+        raw = settings.get("voice_states")
+        if not isinstance(raw, list) or not raw:
+            raw = ["transit", "busy", "focus"]
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    def _voice_reply_decision(self, umo: str, state: str) -> bool:
+        """决定本轮回复是否用语音。
+
+        - transit / busy / focus：直接语音
+        - 其它状态：每次「对话」掷一次骰子（概率 reply_voice_probability），
+          同一对话内保持结果，超过 conversation_gap_minutes 视为新对话
+        """
+        settings = self._voice_settings()
+        if not settings.get("enable", True):
+            return False
+        if state in self._voice_states():
+            return True
+        if self._voice_plugin() is None:
+            return False
+
+        now_ts = self._now().timestamp()
+        gap = max(0, int(settings.get("conversation_gap_minutes", 30))) * 60
+        previous = self._voice_decisions.get(umo)
+        if previous is not None and now_ts - previous[1] <= gap:
+            self._voice_decisions[umo] = (previous[0], now_ts)
+            return previous[0]
+
+        probability = float(settings.get("reply_voice_probability", 0.2))
+        want = random.random() < probability
+        self._voice_decisions[umo] = (want, now_ts)
+        logger.info(
+            "[虚拟人生] 新对话语音判定 umo=%s state=%s want_voice=%s p=%s",
+            umo,
+            state or "unknown",
+            want,
+            probability,
+        )
+        return want
+
+    def _proactive_voice_enabled(self, state: str) -> bool:
+        settings = self._voice_settings()
+        if not settings.get("enable", True):
+            return False
+        if not settings.get("proactive_voice", True):
+            return False
+        return state in self._voice_states() and self._voice_plugin() is not None
+
+    async def _send_proactive_voice(self, umo: str, text: str, state: str) -> bool:
+        if not self._proactive_voice_enabled(state):
+            return False
+        plugin = self._voice_plugin()
+        try:
+            sent = await plugin.send_voice_to(umo, text)
+        except Exception as exc:
+            logger.warning("[虚拟人生] 主动语音发送失败，回退文字：%s", exc)
+            return False
+        return bool(sent)
 
     async def terminate(self) -> None:
         self.runtime.stop()
@@ -1094,6 +1168,7 @@ class ProactiveVirtualDailyPlugin(Star):
         now = self._now()
         current_item = timeline_item_at(plan, now)
         current_state = current_item.activity if current_item else "今日状态暂未明确"
+        state_key = str(getattr(current_item, "state", "") or "")
         await self._record_completed_personal_network_events(persona.id, now)
         relationship_context = await self._personal_network_context(persona.id)
         timeline_context = ""
@@ -1119,7 +1194,8 @@ class ProactiveVirtualDailyPlugin(Star):
             if not self._proactive_context_is_current(umo, generation):
                 logger.info("[虚拟人生] 丢弃 %s 的主动消息：提交前会话已发生变化", umo)
                 return False
-            await self._send_text(umo, text)
+            if not await self._send_proactive_voice(umo, text, state_key):
+                await self._send_text(umo, text)
             await self.message_generator.record_conversation(
                 umo=umo,
                 persona_id=persona.id,
@@ -1546,7 +1622,9 @@ class ProactiveVirtualDailyPlugin(Star):
             "virtual_life_reply_delay_excluded", False
         ):
             event.set_extra("virtual_life_ordinary_llm_request", True)
-        if not self.smart_context_injector.enabled:
+        if not self.smart_context_injector.enabled and not self._voice_settings().get(
+            "enable", True
+        ):
             return
         try:
             persona, plan = await self._ensure_plan_for_umo(event.unified_msg_origin)
@@ -1555,6 +1633,24 @@ class ProactiveVirtualDailyPlugin(Star):
         if plan.status != "ok":
             return
         now = self._now()
+        if self._voice_settings().get("enable", True):
+            voice_item = timeline_item_at(plan, now)
+            voice_state = str(getattr(voice_item, "state", "") or "")
+            want_voice = self._voice_reply_decision(
+                event.unified_msg_origin, voice_state
+            )
+            event.set_extra("vl_voice_reply", want_voice)
+            if want_voice:
+                req.extra_user_content_parts.append(
+                    TextPart(
+                        text=(
+                            "【语音模式】本轮回答会被直接转成语音发给对方："
+                            "请用口语短句，不要使用表情符号、Markdown、列表、代码或链接。"
+                        ),
+                    ).mark_as_temp(),
+                )
+        if not self.smart_context_injector.enabled:
+            return
         current_item = next(
             (
                 item
@@ -1586,6 +1682,31 @@ class ProactiveVirtualDailyPlugin(Star):
                 limit,
                 injection,
             )
+
+    @filter.on_decorating_result(priority=50)
+    async def voice_reply_result(self, event: AstrMessageEvent) -> None:
+        """把本轮的纯文字回复替换成语音（语音插件不可用/合成失败时保留文字）。"""
+        if not event.get_extra("vl_voice_reply", False):
+            return
+        plugin = self._voice_plugin()
+        if plugin is None:
+            return
+        result = event.get_result()
+        chain = getattr(result, "chain", None) if result is not None else None
+        if not chain:
+            return
+        if any(not isinstance(component, Plain) for component in chain):
+            return
+        text = "".join(str(getattr(component, "text", "") or "") for component in chain).strip()
+        if not text:
+            return
+        try:
+            wav_path = await plugin.synthesize_voice(text)
+        except Exception as exc:
+            logger.warning("[虚拟人生] 语音回复合成失败，回退文字：%s", exc)
+            return
+        result.chain = [Record(file=str(wav_path))]
+        logger.info("[虚拟人生] 回复已转为语音：%s", text[:60])
 
     @filter.on_llm_response()
     async def track_delayed_llm_response(
