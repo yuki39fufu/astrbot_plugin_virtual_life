@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain, Record, Reply
+from astrbot.api.message_components import Image, Record, Reply
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -166,7 +166,7 @@ class ProactiveVirtualDailyPlugin(Star):
         return {str(item).strip() for item in raw if str(item).strip()}
 
     def _voice_probability(self, state: str) -> float:
-        """按当前状态返回「这一条回复用语音」的概率。"""
+        """按当前状态返回「这一条输出用语音」的概率。"""
         settings = self._voice_settings()
         if not settings.get("enable", True):
             return 0.0
@@ -175,45 +175,6 @@ class ProactiveVirtualDailyPlugin(Star):
         if state in self._idle_states():
             return float(settings.get("idle_voice_probability", 0.2))
         return 0.0
-
-    def _voice_reply_decision(self, umo: str, state: str) -> bool:
-        """每条输出独立掷骰：忙/通勤 0.7，空闲 0.2，其它状态文字。"""
-        if self._voice_plugin() is None:
-            return False
-        probability = self._voice_probability(state)
-        if probability <= 0:
-            return False
-        want = random.random() < probability
-        logger.info(
-            "[虚拟人生] 语音判定 umo=%s state=%s want_voice=%s p=%.2f",
-            umo,
-            state or "unknown",
-            want,
-            probability,
-        )
-        return want
-
-    def _proactive_voice_enabled(self, state: str) -> bool:
-        settings = self._voice_settings()
-        if not settings.get("enable", True):
-            return False
-        if not settings.get("proactive_voice", True):
-            return False
-        if self._voice_plugin() is None:
-            return False
-        probability = self._voice_probability(state)
-        return probability > 0 and random.random() < probability
-
-    async def _send_proactive_voice(self, umo: str, text: str, state: str) -> bool:
-        if not self._proactive_voice_enabled(state):
-            return False
-        plugin = self._voice_plugin()
-        try:
-            sent = await plugin.send_voice_to(umo, text)
-        except Exception as exc:
-            logger.warning("[虚拟人生] 主动语音发送失败，回退文字：%s", exc)
-            return False
-        return bool(sent)
 
     async def terminate(self) -> None:
         self.runtime.stop()
@@ -1197,8 +1158,7 @@ class ProactiveVirtualDailyPlugin(Star):
             if not self._proactive_context_is_current(umo, generation):
                 logger.info("[虚拟人生] 丢弃 %s 的主动消息：提交前会话已发生变化", umo)
                 return False
-            if not await self._send_proactive_voice(umo, text, state_key):
-                await self._send_text(umo, text)
+            await self._send_text(umo, text, state_key)
             await self.message_generator.record_conversation(
                 umo=umo,
                 persona_id=persona.id,
@@ -1207,7 +1167,7 @@ class ProactiveVirtualDailyPlugin(Star):
             )
         return True
 
-    async def _send_text(self, umo: str, text: str) -> None:
+    async def _send_text(self, umo: str, text: str, state: str = "") -> None:
         result = self.message_segmenter.split(text)
         logger.info(
             "[虚拟人生] 主动消息分段 umo=%s mode=%s chars=%s parts=%s threshold=%s reason=%s",
@@ -1218,8 +1178,20 @@ class ProactiveVirtualDailyPlugin(Star):
             result.threshold,
             result.skipped_reason or "segmented",
         )
+        probability = self._voice_probability(state) if state else 0.0
+        if not self._voice_settings().get("proactive_voice", True):
+            probability = 0.0
+        voice_plugin = self._voice_plugin() if probability > 0 else None
         for index, segment in enumerate(result.segments):
-            sent = await self.context.send_message(umo, MessageChain().message(segment))
+            sent = False
+            if voice_plugin is not None and random.random() < probability:
+                try:
+                    sent = await voice_plugin.send_voice_to(umo, segment)
+                except Exception as exc:
+                    logger.warning("[虚拟人生] 主动语音发送失败，回退文字：%s", exc)
+                    sent = False
+            if not sent:
+                sent = await self.context.send_message(umo, MessageChain().message(segment))
             if not sent:
                 raise RuntimeError(f"platform unavailable for {umo}")
             if index + 1 < len(result.segments):
@@ -1639,15 +1611,14 @@ class ProactiveVirtualDailyPlugin(Star):
         if self._voice_settings().get("enable", True):
             voice_item = timeline_item_at(plan, now)
             voice_state = str(getattr(voice_item, "state", "") or "")
-            want_voice = self._voice_reply_decision(
-                event.unified_msg_origin, voice_state
-            )
-            event.set_extra("vl_voice_reply", want_voice)
-            if want_voice:
+            probability = self._voice_probability(voice_state)
+            event.set_extra("virtual_life_voice_probability", probability)
+            event.set_extra("virtual_life_voice_state", voice_state)
+            if probability > 0:
                 req.extra_user_content_parts.append(
                     TextPart(
                         text=(
-                            "【语音模式】本轮回答会被直接转成语音发给对方："
+                            "【语音模式】本轮回答可能有一部分被拆成语音发给对方："
                             "请用口语短句，不要使用表情符号、Markdown、列表、代码或链接。"
                         ),
                     ).mark_as_temp(),
@@ -1685,31 +1656,6 @@ class ProactiveVirtualDailyPlugin(Star):
                 limit,
                 injection,
             )
-
-    @filter.on_decorating_result(priority=50)
-    async def voice_reply_result(self, event: AstrMessageEvent) -> None:
-        """把本轮的纯文字回复替换成语音（语音插件不可用/合成失败时保留文字）。"""
-        if not event.get_extra("vl_voice_reply", False):
-            return
-        plugin = self._voice_plugin()
-        if plugin is None:
-            return
-        result = event.get_result()
-        chain = getattr(result, "chain", None) if result is not None else None
-        if not chain:
-            return
-        if any(not isinstance(component, Plain) for component in chain):
-            return
-        text = "".join(str(getattr(component, "text", "") or "") for component in chain).strip()
-        if not text:
-            return
-        try:
-            wav_path = await plugin.synthesize_voice(text)
-        except Exception as exc:
-            logger.warning("[虚拟人生] 语音回复合成失败，回退文字：%s", exc)
-            return
-        result.chain = [Record(file=str(wav_path))]
-        logger.info("[虚拟人生] 回复已转为语音：%s", text[:60])
 
     @filter.on_llm_response()
     async def track_delayed_llm_response(

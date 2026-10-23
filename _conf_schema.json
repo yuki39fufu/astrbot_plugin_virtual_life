@@ -834,7 +834,7 @@
       "proactive_voice": {
         "description": "主动消息使用语音",
         "type": "bool",
-        "hint": "开启后，主动消息也按所在状态的语音概率决定发语音还是文字（每条独立掷骰）。",
+        "hint": "开启后，主动消息也逐段按所在状态的语音概率决定语音/文字；关闭则主动消息全文字。",
         "default": true
       },
       "busy_voice_probability": {
